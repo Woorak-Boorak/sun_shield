@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# ================================================================
+# 프로젝트 메인 흐름 (3단계 요약)
+# ① [태양 위치 인식]   : ROI 설정 → SunDetector로 밝고 원형 후보 평가/선택
+# ② [좌표값 변환]       : (dx,dy) → (θ,φ) → (Cx,Cw) → (y%,x%)
+# ③ [웹 실시간 표시]    : WebSocket으로 (v,y,x) 전송 → 브라우저에 원 표시
+# ================================================================
 
 import cv2, math, time, asyncio, threading
 import numpy as np
@@ -16,13 +23,13 @@ except Exception as e:
 SHOW_PREVIEW = bool(os.environ.get("DISPLAY"))
 
 # ─────────────────────────────────────────────────────────────
-# 설정(필요시 여기 숫자만 바꿔 쓰세요)
+# [공통 설정] (필요시 숫자만 조정)
 # ─────────────────────────────────────────────────────────────
 CAM_DEVICE = "/dev/video0"
 W, H, FPS = 640, 480, 30           # 카메라 캡처 해상도/프레임
 FOV_DEG   = 175.0                  # 광각 카메라 대각/수평 기반 FOV(프로젝트 기준)
 
-# ROI 모드: "margin" | "scale"
+# [① 태양 위치 인식]용 ROI 모드 선택: "margin" | "scale"
 ROI_MODE  = "margin"
 
 # margin 모드 파라미터(네 변 절삭)
@@ -34,7 +41,7 @@ SHIFT_X, SHIFT_Y, SCALE = 120, 20, 1.0
 # 보기용 리사이즈 높이
 VIEW_H = 720
 
-# 태양 검출 파라미터(블러/임계/컨투어 스코어)
+# [① 태양 위치 인식] 파라미터(블러/임계/컨투어 스코어)
 BLUR_KSIZE = 30
 THRESH_VAL = 245
 FALLBACK_PERCENTILE = 99.9
@@ -44,19 +51,19 @@ CIRC_EXP, RADIAL_K, AR_EXP, AREA_EXP = 5.0, 12.0, 2.0, 0.3
 # CUDA 사용 (OpenCV CUDA 빌드 + 디바이스 있을 때만 자동 활성)
 USE_CUDA = True
 
-# 화면 좌표 변환(물리 치수/기하 파라미터)
+# [② 좌표값 변환] (모니터 물리 치수/기하 파라미터)
 MONITOR_W_CM = 42.4
 MONITOR_H_CM = 24.0
 L_PARAM_CM   = 15.0   # angles_to_C2()의 l
 TILT_DEG     = 50.0   # angles_to_C2()의 t_deg
 
-# ── WebSocket 송신 설정 ──────────────────────────────────────
+# [③ 웹 표시] WebSocket 송신 설정
 SEND_TO_WS = True
-WS_URL     = "ws://localhost:8000"    # server.py가 띄운 주소(포트 8000) :contentReference[oaicite:4]{index=4}
+WS_URL     = "ws://localhost:8000"    # server.py가 띄운 주소(포트 8000)
 WS_RETRY_SEC = 2.0                    # 재접속 간격(초)
 
 # ─────────────────────────────────────────────────────────────
-# 유틸
+# 유틸(표시용)
 # ─────────────────────────────────────────────────────────────
 def _has_cuda():
     try:
@@ -74,12 +81,12 @@ def draw_crosshair(img, pt, size=10, thickness=1, color=(0,255,255)):
     cv2.line(img, (x, y-size), (x, y+size), color, thickness, cv2.LINE_AA)
 
 # ─────────────────────────────────────────────────────────────
-# 픽셀 → 각도 → 물리좌표 → 퍼센트 변환(테스트 코드 흐름)
+# ② [좌표값 변환] 픽셀 → 각도 → 물리좌표 → 퍼센트
 # ─────────────────────────────────────────────────────────────
 def pixel_to_angles(dx: int, dy: int):
     """
-    중심 기준 픽셀 오프셋 → (θ, φ)[deg]
-    dy는 위가 +가 되도록 (h//2 - full_y)로 넣어야 함.
+    (프레임 중심 기준) 픽셀 오프셋 → (θ, φ)[deg]
+    주의: dy는 위가 + 되도록 (h//2 - full_y)로 계산해 전달
     """
     half = H / 2.0
     dx = max(-half, min(half, dx))
@@ -89,7 +96,7 @@ def pixel_to_angles(dx: int, dy: int):
     return theta, phi
 
 def angles_to_C2(theta_deg: float, phi_deg: float, l: float = L_PARAM_CM, t_deg: float = TILT_DEG):
-    """(θ, φ)[deg] → 2D 좌표 (Cx, Cw) [cm]"""
+    """(θ, φ)[deg] → 2D 좌표 (Cx, Cw) [cm] (카메라 기하 파라미터 l, tilt 적용)"""
     t = math.radians(t_deg)
     sin_t, cos_t = math.sin(t), math.cos(t)
     th = math.radians(theta_deg)
@@ -112,7 +119,7 @@ def cwcx_to_percent(Cx: float, Cw: float):
     return int(round(y_pct)), int(round(x_pct))  # (y%, x%)
 
 # ─────────────────────────────────────────────────────────────
-# SunDetector (컨투어 기반 ‘원형 밝은 점’ 선택)
+# ① [태양 위치 인식] SunDetector (컨투어 기반 ‘원형 밝은 점’ 선택)
 # ─────────────────────────────────────────────────────────────
 class SunDetector:
     def __init__(self, blur_ksize=BLUR_KSIZE, thresh=THRESH_VAL, use_cuda=True):
@@ -184,7 +191,7 @@ class SunDetector:
         }
 
     def find_sun(self, bgr: np.ndarray):
-        # GRAY + BLUR (CUDA 우선, 실패 시 CPU)
+        # [①-1] GRAY + BLUR (CUDA 우선, 실패 시 CPU)
         if self.use_cuda and self._gfilter is not None:
             try:
                 g = cv2.cuda_GpuMat(); g.upload(bgr)
@@ -206,19 +213,20 @@ class SunDetector:
                 if k % 2 == 0: k += 1
             blur = cv2.GaussianBlur(gray, (k, k), 0)
 
-        # 임계 + 모폴로지
+        # [①-2] 임계 + 모폴로지 → 컨투어
         mask = self._threshold_cpu(blur)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
-        # 컨투어
         contours = self._find_contours(mask)
         if not contours:
             return None, mask, []
 
+        # [①-3] 후보 스코어링 및 최적 선택
         infos = []
         for c in contours:
             m = self._circular_metrics(c)
-            if m is None or m["area"] < MIN_AREA_PIX: continue
+            if m is None or m["area"] < MIN_AREA_PIX: 
+                continue
             m["contour"] = c
             infos.append(m)
         if not infos:
@@ -239,7 +247,7 @@ class SunDetector:
         return best, mask, contours
 
 # ─────────────────────────────────────────────────────────────
-# WebSocket 송신(백그라운드 스레드에서 asyncio 루프 구동: Py3.6 호환)
+# ③ [웹 실시간 표시] WebSocket 송신 (백그라운드 스레드에서 asyncio 루프)
 # ─────────────────────────────────────────────────────────────
 class WsSender:
     def __init__(self, url: str, enable: bool = True, retry_sec: float = 2.0):
@@ -310,7 +318,7 @@ class WsSender:
         v = 0 if int(v) == 0 else 1
         y = max(0, min(100, int(y)))
         x = max(0, min(100, int(x)))
-        pkt = f"({v},{y},{x})"  # server/script와 동일 포맷 :contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
+        pkt = f"({v},{y},{x})"  # server/script와 동일 포맷
         try:
             # 스레드 안전 큐 삽입 (루프 스레드에서 소비)
             self._loop.call_soon_threadsafe(self._queue.put_nowait, pkt)
@@ -318,14 +326,15 @@ class WsSender:
             pass
 
 # ─────────────────────────────────────────────────────────────
-# 메인: 캡처 → ROI → 검출 → 각도/퍼센트 변환 → 오버레이/표시 → WS 송신
+# 메인 루프
+# ① 캡처/ROI/검출 → ② 각도·좌표 변환 → ③ WS 송신 & 오버레이
 # ─────────────────────────────────────────────────────────────
 def main():
-    # WebSocket 송신기 가동
+    # [③] WebSocket 송신기 가동
     ws = WsSender(WS_URL, enable=SEND_TO_WS, retry_sec=WS_RETRY_SEC)
     ws.start()
 
-    # 1) GStreamer(MJPEG) 시도
+    # 캡처 초기화 (1) GStreamer(MJPEG) 우선
     gst = (
         f"v4l2src device={CAM_DEVICE} ! "
         f"image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
@@ -333,14 +342,14 @@ def main():
     )
     cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
 
-    # 2) 실패하면 V4L2 + MJPG 강제
+    # (2) 실패 시 V4L2 + MJPG 강제
     if not cap.isOpened():
         print("[경고] GStreamer 파이프라인 실패 → 기본 V4L2 시도")
         cap = cv2.VideoCapture(0)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
         cap.set(cv2.CAP_PROP_FPS,          FPS)
-        # MJPG로 포맷 강제 (해당 카메라 스펙상 30fps 유리) 
+        # MJPG로 포맷 강제 (해당 카메라 스펙상 30fps 유리)
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         cap.set(cv2.CAP_PROP_FOURCC, fourcc)
 
@@ -356,14 +365,16 @@ def main():
 
     t0, n = time.time(), 0
     last_yx = (50, 50)  # 미검출 시 마지막 좌표 유지용
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         h, w = frame.shape[:2]
 
-        # ROI
+        # ── ① [태양 위치 인식] ROI 설정 ──────────────────────
         if ROI_MODE == "margin":
+            # 네 변 절삭 (설치각 고정인 경우 단순/견고)
             x = max(0, min(w - 1, MARGIN_L))
             y = max(0, min(h - 1, MARGIN_T))
             cw = max(1, w - x - max(0, MARGIN_R))
@@ -372,6 +383,7 @@ def main():
             label = f"MARGIN roi {cw}x{ch} L{MARGIN_L} R{MARGIN_R} T{MARGIN_T} B{MARGIN_B}"
             roi_offset = (x, y)
         else:
+            # 축소+이동 (환경 유동적일 때 유연 조정)
             cw = max(1, min(w, int(w * SCALE)))
             ch = max(1, min(h, int(h * SCALE)))
             x  = max(0, min(w - cw, (w - cw)//2 + SHIFT_X))
@@ -380,7 +392,7 @@ def main():
             label = f"SCALE roi {cw}x{ch} shift({SHIFT_X},{SHIFT_Y}) scale={SCALE}"
             roi_offset = (x, y)
 
-        # 검출
+        # ── ① [태양 위치 인식] 검출 ──────────────────────────
         best, mask, contours = detector.find_sun(roi)
 
         if contours:
@@ -399,20 +411,20 @@ def main():
             full_x = roi_offset[0] + cx
             full_y = roi_offset[1] + cy
 
-            # 중심 기준 좌표계 (y는 위가 +)
+            # ── ② [좌표값 변환] 중심 기준 좌표계 (y는 위가 +) ──
             dx = full_x - (w // 2)
             dy = (h // 2) - full_y
 
-            # 각도 변환 → 2D → 퍼센트
+            # (dx,dy) → (θ,φ) → (Cx,Cw) → (y%,x%)
             theta, phi = pixel_to_angles(dx, dy)
             Cx, Cw = angles_to_C2(theta, phi, l=L_PARAM_CM, t_deg=TILT_DEG)
             y_pct, x_pct = cwcx_to_percent(Cx, Cw)
             last_yx = (y_pct, x_pct)
 
-            # 콘솔 로그
+            # 로그(검증용)
             print(f"percent: y={y_pct}%, x={x_pct}%  |  θ={theta:.1f}°, φ={phi:.1f}°  Cx={Cx:.2f}cm Cw={Cw:.2f}cm")
 
-            # 웹소켓 전송 (보임=1)
+            # ── ③ [웹 실시간 표시] WebSocket 송신 (보임=1) ─────
             ws.send_packet(1, y_pct, x_pct)
 
             sun_text = (
@@ -422,10 +434,10 @@ def main():
                 f"{x_pct}%, {y_pct}%"
             )
         else:
-            # 미검출 시: 원 숨김(0, last_y, last_x)
+            # 미검출 시: [③] 원 숨김(0, last_y, last_x)
             ws.send_packet(0, last_yx[0], last_yx[1])
 
-        # 보기용 리사이즈
+        # ── (옵션) 미리보기 오버레이 ──────────────────────────
         disp_w = max(1, int(roi.shape[1] * (VIEW_H / roi.shape[0])))
         disp   = cv2.resize(roi, (disp_w, VIEW_H), interpolation=cv2.INTER_AREA)
         disp_h, disp_w2 = disp.shape[:2]
@@ -450,7 +462,6 @@ def main():
         else:
             # 헤드리스일 경우 잠깐 쉬어주기
             time.sleep(0.001)
-
 
     cap.release()
     if SHOW_PREVIEW:
